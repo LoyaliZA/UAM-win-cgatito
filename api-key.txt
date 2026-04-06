@@ -1,0 +1,3 @@
+static readonly string ApiUrl = "https://uam.neobash.site/api/logs";
+        static readonly string ApiToken = "1|azIcluH5CvcfvqrcmhaZHAouVYTrbcd03fXepYO832bb8316";
+        static readonly string EmployeeId = "KRYS-CALL-C-01";
